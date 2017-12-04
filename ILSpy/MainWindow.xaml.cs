@@ -31,10 +31,11 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.Documentation;
 using ICSharpCode.ILSpy.TextView;
 using ICSharpCode.ILSpy.TreeNodes;
-using ICSharpCode.ILSpy.XmlDoc;
 using ICSharpCode.TreeView;
 using Microsoft.Win32;
 using Mono.Cecil;
@@ -92,7 +93,7 @@ namespace ICSharpCode.ILSpy
 			InitToolbar();
 			ContextMenuProvider.Add(treeView, decompilerTextView);
 			
-			this.Loaded += new RoutedEventHandler(MainWindow_Loaded);
+			this.Loaded += MainWindow_Loaded;
 		}
 		
 		void SetWindowBounds(Rect bounds)
@@ -247,9 +248,7 @@ namespace ICSharpCode.ILSpy
 		
 		bool HandleCommandLineArguments(CommandLineArguments args)
 		{
-			foreach (string file in args.AssembliesToLoad) {
-				commandLineLoadedAssemblies.Add(assemblyList.OpenAssembly(file));
-			}
+			LoadAssemblies(args.AssembliesToLoad, commandLineLoadedAssemblies, false);
 			if (args.Language != null)
 				sessionSettings.FilterSettings.Language = Languages.GetLanguage(args.Language);
 			return true;
@@ -282,7 +281,7 @@ namespace ICSharpCode.ILSpy
 					}
 				} else {
 					foreach (LoadedAssembly asm in commandLineLoadedAssemblies) {
-						ModuleDefinition def = asm.ModuleDefinition;
+						ModuleDefinition def = asm.GetModuleDefinitionAsync().Result;
 						if (def != null) {
 							MemberReference mr = XmlDocKeyProvider.FindMemberByKey(def, args.NavigateTo);
 							if (mr != null) {
@@ -301,7 +300,7 @@ namespace ICSharpCode.ILSpy
 			} else if (commandLineLoadedAssemblies.Count == 1) {
 				// NavigateTo == null and an assembly was given on the command-line:
 				// Select the newly loaded assembly
-				JumpToReference(commandLineLoadedAssemblies[0].ModuleDefinition);
+				JumpToReference(commandLineLoadedAssemblies[0].GetModuleDefinitionAsync().Result);
 			}
 			if (args.Search != null)
 			{
@@ -332,28 +331,32 @@ namespace ICSharpCode.ILSpy
 		{
 			ILSpySettings spySettings = this.spySettings;
 			this.spySettings = null;
-			
+
 			// Load AssemblyList only in Loaded event so that WPF is initialized before we start the CPU-heavy stuff.
 			// This makes the UI come up a bit faster.
 			this.assemblyList = assemblyListManager.LoadList(spySettings, sessionSettings.ActiveAssemblyList);
-			
+
 			HandleCommandLineArguments(App.CommandLineArguments);
-			
+
 			if (assemblyList.GetAssemblies().Length == 0
-				&& assemblyList.ListName == AssemblyListManager.DefaultListName)
-			{
+				&& assemblyList.ListName == AssemblyListManager.DefaultListName) {
 				LoadInitialAssemblies();
 			}
-			
+
 			ShowAssemblyList(this.assemblyList);
-			
+
+			Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => OpenAssemblies(spySettings)));
+		}
+
+		void OpenAssemblies(ILSpySettings spySettings)
+		{
 			HandleCommandLineArgumentsAfterShowList(App.CommandLineArguments);
 			if (App.CommandLineArguments.NavigateTo == null && App.CommandLineArguments.AssembliesToLoad.Count != 1) {
 				SharpTreeNode node = null;
 				if (sessionSettings.ActiveTreeViewPath != null) {
 					node = FindNodeByPath(sessionSettings.ActiveTreeViewPath, true);
-					if (node == this.assemblyListTreeNode & sessionSettings.ActiveAutoLoadedAssembly != null) {
-						this.assemblyList.OpenAssembly(sessionSettings.ActiveAutoLoadedAssembly, true);
+					if (node == this.assemblyListTreeNode && sessionSettings.ActiveAutoLoadedAssembly != null) {
+						this.assemblyList.Open(sessionSettings.ActiveAutoLoadedAssembly, true);
 						node = FindNodeByPath(sessionSettings.ActiveTreeViewPath, true);
 					}
 				}
@@ -418,7 +421,7 @@ namespace ICSharpCode.ILSpy
 		void downloadOrCheckUpdateButtonClick(object sender, RoutedEventArgs e)
 		{
 			if (updateAvailableDownloadUrl != null) {
-				Process.Start(updateAvailableDownloadUrl);
+				MainWindow.OpenLink(updateAvailableDownloadUrl);
 			} else {
 				updatePanel.Visibility = Visibility.Collapsed;
 				AboutPage.CheckForUpdatesAsync(spySettings ?? ILSpySettings.Load())
@@ -500,12 +503,7 @@ namespace ICSharpCode.ILSpy
 				typeof(System.Windows.Markup.MarkupExtension).Assembly,
 				typeof(System.Windows.Rect).Assembly,
 				typeof(System.Windows.UIElement).Assembly,
-				typeof(System.Windows.FrameworkElement).Assembly,
-				typeof(ICSharpCode.TreeView.SharpTreeView).Assembly,
-				typeof(Mono.Cecil.AssemblyDefinition).Assembly,
-				typeof(ICSharpCode.AvalonEdit.TextEditor).Assembly,
-				typeof(ICSharpCode.Decompiler.Ast.AstBuilder).Assembly,
-				typeof(MainWindow).Assembly
+				typeof(System.Windows.FrameworkElement).Assembly
 			};
 			foreach (System.Reflection.Assembly asm in initialAssemblies)
 				assemblyList.OpenAssembly(asm.Location);
@@ -572,6 +570,9 @@ namespace ICSharpCode.ILSpy
 					break;
 				bestMatch = node;
 				node.EnsureLazyChildren();
+				var ilSpyTreeNode = node as ILSpyTreeNode;
+				if (ilSpyTreeNode != null)
+					ilSpyTreeNode.EnsureChildrenFiltered();
 				node = node.Children.FirstOrDefault(c => c.ToString() == element);
 			}
 			if (returnBestMatch)
@@ -656,13 +657,21 @@ namespace ICSharpCode.ILSpy
 				SelectNode(treeNode);
 			} else if (reference is Mono.Cecil.Cil.OpCode) {
 				string link = "http://msdn.microsoft.com/library/system.reflection.emit.opcodes." + ((Mono.Cecil.Cil.OpCode)reference).Code.ToString().ToLowerInvariant() + ".aspx";
-				try {
-					Process.Start(link);
-				} catch {
-					
-				}
+				OpenLink(link);
 			}
 			return decompilationTask;
+		}
+
+		public static void OpenLink(string link)
+		{
+			try {
+				Process.Start(link);
+#pragma warning disable RECS0022 // A catch clause that catches System.Exception and has an empty body
+			} catch (Exception) {
+#pragma warning restore RECS0022 // A catch clause that catches System.Exception and has an empty body
+				// Process.Start can throw several errors (not all of them documented),
+				// just ignore all of them.
+			}
 		}
 		#endregion
 		
@@ -671,7 +680,7 @@ namespace ICSharpCode.ILSpy
 		{
 			e.Handled = true;
 			OpenFileDialog dlg = new OpenFileDialog();
-			dlg.Filter = ".NET assemblies|*.dll;*.exe;*.winmd|All files|*.*";
+			dlg.Filter = ".NET assemblies|*.dll;*.exe;*.winmd|Nuget Packages (*.nupkg)|*.nupkg|All files|*.*";
 			dlg.Multiselect = true;
 			dlg.RestoreDirectory = true;
 			if (dlg.ShowDialog() == true) {
@@ -682,21 +691,56 @@ namespace ICSharpCode.ILSpy
 		public void OpenFiles(string[] fileNames, bool focusNode = true)
 		{
 			if (fileNames == null)
-				throw new ArgumentNullException("fileNames");
+				throw new ArgumentNullException(nameof(fileNames));
 			
 			if (focusNode)
 				treeView.UnselectAll();
-			
+
+			LoadAssemblies(fileNames, focusNode: focusNode);
+		}
+
+		void LoadAssemblies(IEnumerable<string> fileNames, List<LoadedAssembly> loadedAssemblies = null, bool focusNode = true)
+		{
 			SharpTreeNode lastNode = null;
 			foreach (string file in fileNames) {
-				var asm = assemblyList.OpenAssembly(file);
-				if (asm != null) {
-					var node = assemblyListTreeNode.FindAssemblyNode(asm);
-					if (node != null && focusNode) {
-						treeView.SelectedItems.Add(node);
-						lastNode = node;
-					}
+				switch (Path.GetExtension(file)) {
+					case ".nupkg":
+						LoadedNugetPackage package = new LoadedNugetPackage(file);
+						var selectionDialog = new NugetPackageBrowserDialog(package);
+						selectionDialog.Owner = this;
+						if (selectionDialog.ShowDialog() != true)
+							break;
+						foreach (var entry in selectionDialog.SelectedItems) {
+							var nugetAsm = assemblyList.OpenAssembly("nupkg://" + file + ";" + entry.Name, entry.Stream, true);
+							if (nugetAsm != null) {
+								if (loadedAssemblies != null)
+									loadedAssemblies.Add(nugetAsm);
+								else {
+									var node = assemblyListTreeNode.FindAssemblyNode(nugetAsm);
+									if (node != null && focusNode) {
+										treeView.SelectedItems.Add(node);
+										lastNode = node;
+									}
+								}
+							}
+						}
+						break;
+					default:
+						var asm = assemblyList.OpenAssembly(file);
+						if (asm != null) {
+							if (loadedAssemblies != null)
+								loadedAssemblies.Add(asm);
+							else {
+								var node = assemblyListTreeNode.FindAssemblyNode(asm);
+								if (node != null && focusNode) {
+									treeView.SelectedItems.Add(node);
+									lastNode = node;
+								}
+							}
+						}
+						break;
 				}
+
 				if (lastNode != null && focusNode)
 					treeView.FocusNode(lastNode);
 			}
@@ -744,7 +788,7 @@ namespace ICSharpCode.ILSpy
 				if (node != null && node.View(decompilerTextView))
 					return;
 			}
-			decompilationTask = decompilerTextView.DecompileAsync(this.CurrentLanguage, this.SelectedNodes, new DecompilationOptions() { TextViewState = state });
+			decompilationTask = decompilerTextView.DecompileAsync(this.CurrentLanguage, this.SelectedNodes, new DecompilationOptions { TextViewState = state });
 		}
 		
 		void SaveCommandExecuted(object sender, ExecutedRoutedEventArgs e)
@@ -755,7 +799,7 @@ namespace ICSharpCode.ILSpy
 			}
 			this.TextView.SaveToDisk(this.CurrentLanguage,
 				this.SelectedNodes,
-				new DecompilationOptions() { FullDecompilation = true });
+				new DecompilationOptions { FullDecompilation = true });
 		}
 		
 		public void RefreshDecompiledView()
@@ -781,7 +825,7 @@ namespace ICSharpCode.ILSpy
 			}
 		}
 		#endregion
-		
+
 		#region Back/Forward navigation
 		void BackCommandCanExecute(object sender, CanExecuteRoutedEventArgs e)
 		{
@@ -849,7 +893,7 @@ namespace ICSharpCode.ILSpy
 			sessionSettings.WindowBounds = this.RestoreBounds;
 			sessionSettings.SplitterPosition = leftColumn.Width.Value / (leftColumn.Width.Value + rightColumn.Width.Value);
 			if (topPane.Visibility == Visibility.Visible)
-				sessionSettings.BottomPaneSplitterPosition = topPaneRow.Height.Value / (topPaneRow.Height.Value + textViewRow.Height.Value);
+				sessionSettings.TopPaneSplitterPosition = topPaneRow.Height.Value / (topPaneRow.Height.Value + textViewRow.Height.Value);
 			if (bottomPane.Visibility == Visibility.Visible)
 				sessionSettings.BottomPaneSplitterPosition = bottomPaneRow.Height.Value / (bottomPaneRow.Height.Value + textViewRow.Height.Value);
 			sessionSettings.Save();
@@ -872,10 +916,40 @@ namespace ICSharpCode.ILSpy
 		}
 		
 		#region Top/Bottom Pane management
+
+		/// <summary>
+		///   When grid is resized using splitter, row height value could become greater than 1.
+		///   As result, when a new pane is shown, both textView and pane could become very small.
+		///   This method normalizes two rows and ensures that height is less then 1.
+		/// </summary>
+		void NormalizePaneRowHeightValues(RowDefinition pane1Row, RowDefinition pane2Row)
+		{
+			var pane1Height = pane1Row.Height;
+			var pane2Height = pane2Row.Height;
+
+			//only star height values are normalized.
+			if (!pane1Height.IsStar || !pane2Height.IsStar)
+			{
+				return;
+			}
+
+			var totalHeight = pane1Height.Value + pane2Height.Value;
+			if (totalHeight == 0)
+			{
+				return;
+			}
+
+			pane1Row.Height = new GridLength(pane1Height.Value / totalHeight, GridUnitType.Star);
+			pane2Row.Height = new GridLength(pane2Height.Value / totalHeight, GridUnitType.Star);
+		}
+
 		public void ShowInTopPane(string title, object content)
 		{
 			topPaneRow.MinHeight = 100;
 			if (sessionSettings.TopPaneSplitterPosition > 0 && sessionSettings.TopPaneSplitterPosition < 1) {
+				//Ensure all 3 blocks are in fair conditions
+				NormalizePaneRowHeightValues(bottomPaneRow, textViewRow);
+
 				textViewRow.Height = new GridLength(1 - sessionSettings.TopPaneSplitterPosition, GridUnitType.Star);
 				topPaneRow.Height = new GridLength(sessionSettings.TopPaneSplitterPosition, GridUnitType.Star);
 			}
@@ -906,6 +980,9 @@ namespace ICSharpCode.ILSpy
 		{
 			bottomPaneRow.MinHeight = 100;
 			if (sessionSettings.BottomPaneSplitterPosition > 0 && sessionSettings.BottomPaneSplitterPosition < 1) {
+				//Ensure all 3 blocks are in fair conditions
+				NormalizePaneRowHeightValues(topPaneRow, textViewRow);
+
 				textViewRow.Height = new GridLength(1 - sessionSettings.BottomPaneSplitterPosition, GridUnitType.Star);
 				bottomPaneRow.Height = new GridLength(sessionSettings.BottomPaneSplitterPosition, GridUnitType.Star);
 			}

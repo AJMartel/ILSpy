@@ -2,15 +2,11 @@
 // This code is distributed under the MS-PL (for details please see \doc\MS-PL.txt)
 
 using System;
-using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.IO;
 
 using ICSharpCode.ILSpy.TreeNodes;
 using ICSharpCode.ILSpy;
-using System.Resources;
-using System.Collections;
-using System.Linq;
 
 namespace ILSpy.BamlDecompiler
 {
@@ -39,7 +35,7 @@ namespace ILSpy.BamlDecompiler
 
 		public string WriteResourceToFile(LoadedAssembly assembly, string fileName, Stream stream, DecompilationOptions options)
 		{
-			var document = BamlResourceEntryNode.LoadIntoDocument(assembly.GetAssemblyResolver(), assembly.AssemblyDefinition, stream);
+			var document = BamlResourceEntryNode.LoadIntoDocument(assembly.GetAssemblyResolver(), assembly.GetAssemblyDefinitionAsync().Result, stream, options.CancellationToken);
 			fileName = Path.ChangeExtension(fileName, ".xaml");
 			document.Save(Path.Combine(options.SaveAsProjectDirectory, fileName));
 			return fileName;

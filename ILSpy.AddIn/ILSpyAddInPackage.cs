@@ -3,14 +3,13 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.ComponentModel.Design;
-using Microsoft.Win32;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.Shell.Interop;
-using Microsoft.VisualStudio.OLE.Interop;
 using Microsoft.VisualStudio.Shell;
-using System.Reflection;
 using System.IO;
 using Mono.Cecil;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace ICSharpCode.ILSpy.AddIn
 {
@@ -68,7 +67,8 @@ namespace ICSharpCode.ILSpy.AddIn
 			if (null != mcs) {
 				// Create the command for the References context menu.
 				CommandID menuCommandID = new CommandID(GuidList.guidILSpyAddInCmdSet, (int)PkgCmdIDList.cmdidOpenReferenceInILSpy);
-				MenuCommand menuItem = new MenuCommand(OpenReferenceInILSpyCallback, menuCommandID);
+				OleMenuCommand menuItem = new OleMenuCommand(OpenReferenceInILSpyCallback, menuCommandID);
+				menuItem.BeforeQueryStatus += OpenReferenceInILSpyCallback_BeforeQueryStatus;
 				mcs.AddCommand(menuItem);
 
 				// Create the command for the Project context menu, to open the output assembly.
@@ -90,11 +90,23 @@ namespace ICSharpCode.ILSpy.AddIn
 		}
 		#endregion
 
-		/// <summary>
-		/// This function is the callback used to execute a command when the a menu item is clicked.
-		/// See the Initialize method to see how the menu item is associated to this function using
-		/// the OleMenuCommandService service and the MenuCommand class.
-		/// </summary>
+		string[] SupportedItems = new[] {
+			"Microsoft.VisualStudio.ProjectSystem.VS.Implementation.Package.Automation.OAProjectItem",
+			"Microsoft.VisualStudio.ProjectSystem.VS.Implementation.Package.Automation.OAReferenceItem"
+		};
+
+		private void OpenReferenceInILSpyCallback_BeforeQueryStatus(object sender, EventArgs e)
+		{
+			OleMenuCommand command = (OleMenuCommand)sender;
+			var explorer = ((EnvDTE80.DTE2)GetGlobalService(typeof(EnvDTE.DTE))).ToolWindows.SolutionExplorer;
+			var items = (object[])explorer.SelectedItems;
+			if (!items.OfType<EnvDTE.UIHierarchyItem>().Any()) {
+				command.Visible = false;
+			} else {
+				command.Visible = items.OfType<EnvDTE.UIHierarchyItem>().All(i => SupportedItems.Contains(i.Object.GetType().FullName) && HasProperties(((dynamic)i.Object).Properties, "Type", "Version", "ResolvedPath"));
+			}
+		}
+
 		private void OpenReferenceInILSpyCallback(object sender, EventArgs e)
 		{
 			var explorer = ((EnvDTE80.DTE2)GetGlobalService(typeof(EnvDTE.DTE))).ToolWindows.SolutionExplorer;
@@ -102,6 +114,10 @@ namespace ICSharpCode.ILSpy.AddIn
 
 			foreach (EnvDTE.UIHierarchyItem item in items) {
 				var reference = GetReference(item.Object);
+				if (reference == null) {
+					ShowMessage("No reference information was found in the selection!");
+					continue;
+				}
 				string path = null;
 				if (!string.IsNullOrEmpty(reference.PublicKeyToken)) {
 					var token = Utils.HexStringToBytes(reference.PublicKeyToken);
@@ -109,7 +125,7 @@ namespace ICSharpCode.ILSpy.AddIn
 				}
 				if (path == null)
 					path = reference.Path;
-				OpenAssemblyInILSpy(path);
+				OpenAssembliesInILSpy(new[] { path });
 			}
 		}
 
@@ -119,30 +135,115 @@ namespace ICSharpCode.ILSpy.AddIn
 			public string PublicKeyToken { get; set; }
 			public string Path { get; set; }
 			public Version Version { get; set; }
+
+			internal static ReferenceInfo FromFullName(string fullName)
+			{
+				string[] parts = fullName.Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries);
+				return new ReferenceInfo {
+					Name = parts[0],
+					Version = new Version(parts[1].Substring("Version=".Length)),
+					PublicKeyToken = parts[3].Substring("PublicKeyToken=".Length)
+				};
+			}
 		}
 
 		private ReferenceInfo GetReference(object o)
 		{
-			dynamic obj = o;
+			var projectItem = (EnvDTE.ProjectItem)o;
 			string referenceType = o.GetType().FullName;
+			string[] values;
 
-			// C++
-			if (referenceType.StartsWith("Microsoft.VisualStudio.PlatformUI", StringComparison.Ordinal)) {
-				return new ReferenceInfo { Path = obj.Name };
+			switch (referenceType) {
+				case "Microsoft.VisualStudio.ProjectSystem.VS.Implementation.Package.Automation.OAReferenceItem":
+				case "Microsoft.VisualStudio.ProjectSystem.VS.Implementation.Package.Automation.OAProjectItem":
+					values = GetProperties(projectItem.Properties, "Type", "FusionName", "ResolvedPath");
+					if (values[0] == "Package") {
+						values = GetProperties(projectItem.Properties, "Name", "Version", "Path");
+						if (values[0] != null && values[1] != null && values[2] != null) {
+							return new ReferenceInfo {
+								Name = values[0],
+								Path = $"{values[2]}\\{values[0]}.{values[1]}.nupkg"
+							};
+						}
+					} else if (values[2] != null) {
+						return new ReferenceInfo { Path = values[2] };
+					} else if (!string.IsNullOrWhiteSpace(values[1])) {
+						return ReferenceInfo.FromFullName(values[1]);
+					}
+					return null;
+				default:
+					dynamic obj = o;
+
+					// C++
+					if (referenceType.StartsWith("Microsoft.VisualStudio.PlatformUI", StringComparison.Ordinal)) {
+						return new ReferenceInfo { Path = projectItem.Name };
+					}
+
+					// F#
+					if (referenceType.StartsWith("Microsoft.VisualStudio.FSharp", StringComparison.Ordinal)) {
+						o = projectItem.Object;
+					}
+
+					// C# and VB
+					return new ReferenceInfo {
+						Name = obj.Identity,
+						PublicKeyToken = obj.PublicKeyToken,
+						Path = obj.Path,
+						Version = new Version(obj.Version)
+					};
 			}
+		}
 
-			// F#
-			if (referenceType.StartsWith("Microsoft.VisualStudio.FSharp", StringComparison.Ordinal)) {
-				obj = obj.Object;
+		private string[] GetProperties(EnvDTE.Properties properties, params string[] names)
+		{
+			string[] values = new string[names.Length];
+			foreach (dynamic p in properties) {
+				try {
+					ShowMessage("Name: " + p.Name + ", Value: " + p.Value);
+					for (int i = 0; i < names.Length; i++) {
+						if (names[i] == p.Name) {
+							values[i] = p.Value;
+							break;
+						}
+					}
+				} catch {
+					continue;
+				}
 			}
+			return values;
+		}
 
-			// C# and VB
-			return new ReferenceInfo {
-				Name = obj.Identity,
-				PublicKeyToken = obj.PublicKeyToken,
-				Path = obj.Path,
-				Version = new Version(obj.Version)
-			};
+		private object GetPropertyObject(EnvDTE.Properties properties, string name)
+		{
+			foreach (dynamic p in properties) {
+				try {
+					if (name == p.Name) {
+						return p.Object;
+					}
+				} catch {
+					continue;
+				}
+			}
+			return null;
+		}
+
+		private bool HasProperties(EnvDTE.Properties properties, params string[] names)
+		{
+			return properties.Count > 0 && names.Any(n => HasProperty(properties, n));
+		}
+
+		private bool HasProperty(EnvDTE.Properties properties, string name)
+		{
+			foreach (dynamic p in properties) {
+				try {
+					if (name == p.Name) {
+						return true;
+					}
+				} catch {
+					continue;
+				}
+			}
+			return false;
 		}
 
 		private void OpenProjectOutputInILSpyCallback(object sender, EventArgs e)
@@ -230,20 +331,33 @@ namespace ICSharpCode.ILSpy.AddIn
 		private void OpenProjectInILSpy(EnvDTE.Project project, params string[] arguments)
 		{
 			EnvDTE.Configuration config = project.ConfigurationManager.ActiveConfiguration;
-			string projectPath = Path.GetDirectoryName(project.FileName);
-			string outputPath = config.Properties.Item("OutputPath").Value.ToString();
-			string assemblyFileName = project.Properties.Item("OutputFileName").Value.ToString();
-			OpenAssemblyInILSpy(Path.Combine(projectPath, outputPath, assemblyFileName), arguments);
+			var outputFiles = config.OutputGroups.OfType<EnvDTE.OutputGroup>()
+				.Where(g => g.FileCount > 0 && g.CanonicalName == "Built")
+				.SelectMany(g => (object[])g.FileURLs).Select(f => f?.ToString())
+				.Where(CheckExtension).Select(f => f.Substring("file:///".Length)).ToArray();
+			OpenAssembliesInILSpy(outputFiles, arguments);
 		}
 
-		private void OpenAssemblyInILSpy(string assemblyFileName, params string[] arguments)
+		private bool CheckExtension(string fileName)
 		{
-			if (!File.Exists(assemblyFileName)) {
-				ShowMessage("Could not find assembly '{0}', please ensure the project and all references were built correctly!", assemblyFileName);
-				return;
+			switch (Path.GetExtension(fileName).ToLowerInvariant()) {
+				case ".exe":
+				case ".dll":
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		private void OpenAssembliesInILSpy(IEnumerable<string> assemblyFileNames, params string[] arguments)
+		{
+			foreach (string assemblyFileName in assemblyFileNames) {
+				if (!File.Exists(assemblyFileName)) {
+					ShowMessage("Could not find assembly '{0}', please ensure the project and all references were built correctly!", assemblyFileName);
+				}
 			}
 
-			string commandLineArguments = Utils.ArgumentArrayToCommandLine(assemblyFileName);
+			string commandLineArguments = Utils.ArgumentArrayToCommandLine(assemblyFileNames.ToArray());
 			if (arguments != null) {
 				commandLineArguments = string.Concat(commandLineArguments, " ", Utils.ArgumentArrayToCommandLine(arguments));
 			}
